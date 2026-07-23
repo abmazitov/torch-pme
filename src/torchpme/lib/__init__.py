@@ -1,3 +1,4 @@
+from .batching import ewald_params_from_num_k, prepare_tiled_batch, shrink_2d_cell
 from .kspace_filter import KSpaceFilter, KSpaceKernel, P3MKSpaceFilter
 from .kvectors import (
     compute_batched_kvectors,
@@ -32,4 +33,7 @@ __all__ = [
     "gamma",
     "gammaincc_over_powerlaw",
     "exp1",
+    "ewald_params_from_num_k",
+    "prepare_tiled_batch",
+    "shrink_2d_cell",
 ]
