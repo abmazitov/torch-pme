@@ -46,6 +46,10 @@ def shrink_2d_cell(
     keeps the residual error of the slab treatment at :math:`\approx e^{-3\pi}`.
     The cell is returned unchanged if it is not 2D-periodic or already short enough.
 
+    A zero non-periodic cell vector (the ``metatomic`` convention for non-periodic
+    directions) is supported: the vacuum axis is then synthesized along the normal of
+    the periodic plane at the shrunk height.
+
     :param cell: torch.tensor of shape ``(3, 3)``, where ``cell[i]`` is the i-th basis
         vector of the unit cell
     :param periodic: torch.tensor of shape ``(3,)`` and dtype bool
@@ -58,7 +62,14 @@ def shrink_2d_cell(
     axis = int(torch.argmax((~periodic).to(torch.int64)))
     vac = cell[axis]
     height = torch.linalg.norm(vac)
-    normal = vac / height
+    if height > 0:
+        normal = vac / height
+    else:
+        # zero vacuum row: build the axis from the periodic-plane normal
+        r1 = cell[(axis + 1) % 3]
+        r2 = cell[(axis + 2) % 3]
+        normal = torch.linalg.cross(r1, r2)
+        normal = normal / torch.linalg.norm(normal)
 
     # slab thickness as the extent of the atoms along the vacuum-axis direction
     z = positions @ normal
@@ -68,7 +79,7 @@ def shrink_2d_cell(
     l_max = max(lengths[i] for i in range(3) if i != axis)  # longest periodic vector
     h_min = thickness + 1.5 * l_max
 
-    if height <= h_min:
+    if height > 0 and height <= h_min:
         return cell
 
     new_cell = cell.clone()
