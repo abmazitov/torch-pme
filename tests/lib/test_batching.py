@@ -348,7 +348,7 @@ def test_batch_dispatch_table_groups_atom_tiles_contiguously():
 
 def test_batch_pbc_atom_marks_periodic_systems():
     samples = [crystal(box=4.0), cluster(), slab()]
-    batch, tiling = collate(samples)
+    _, tiling = collate(samples)
     expected = torch.cat(
         [
             torch.full(

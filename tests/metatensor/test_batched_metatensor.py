@@ -137,7 +137,7 @@ def test_batched_matches_pure_torch(calculator):
         *[sample_3d("CsCl"), sample_2d(), sample_0d(), sample_3d("NaCl_cubic")],
         strict=False,
     )
-    result, tiling = evaluate(calculator, list(systems), list(blocks))
+    result, _ = evaluate(calculator, list(systems), list(blocks))
     values = result.block().values
     assert torch.all(torch.isfinite(values))
 
