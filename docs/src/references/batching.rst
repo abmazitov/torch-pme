@@ -137,6 +137,15 @@ The evaluation is split into three steps:
    ``batch`` dictionary holding the concatenated inputs and a ``tiling`` dictionary
    holding the static index tensors. This step runs on the host, once per batch, and
    nothing in it is differentiable.
+
+   Because it decides the *shapes* of the tiling — the k-grid extents, the padded
+   k-count, the length of the flat atom layout — it needs a handful of values as host
+   integers, and copies the per-system metadata from the device in one go: a batch of
+   3D-periodic and non-periodic systems synchronizes once, however many systems it
+   holds. Only 2D slabs add to that, through the scalars
+   :func:`torchpme.lib.shrink_2d_cell` reads back per slab. Collating on CPU tensors —
+   in a dataloader worker, say — and moving the batch to the device afterwards avoids
+   the transfers altogether.
 #. Evaluate the batch with :meth:`forward_batched
    <torchpme.EwaldCalculator.forward_batched>`, passing the entries of ``batch``
    together with ``tiling``. The per-system smearing derived from ``num_k`` overrides
@@ -169,9 +178,9 @@ half of the :ref:`batched example <sphx_glr_examples_13-batched-ewald.py>` runs 
 same systems through this interface.
 
 Pair distances are recomputed internally from the neighbor blocks' distance
-*vectors*, so forces flow to the positions those vectors were computed from. The
-calculator (including ``forward_batched``) is TorchScript-compatible; only the
-``prepare_tiled_batch`` helpers are eager-only host code.
+*vectors*, so forces flow to the positions those vectors were computed from. Both the
+calculator (including ``forward_batched``) and the two ``prepare_tiled_batch``
+front-ends are TorchScript-compatible.
 
 Practical notes
 ===============
@@ -187,7 +196,12 @@ Practical notes
   ``block_kvecs`` (up to floating-point summation order); they only affect
   performance.
 - The tiling depends only on cells, periodicities, atom counts and pair counts — it
-  must be rebuilt when those change (e.g. a new batch), not when positions move.
+  must be rebuilt when those change (e.g. a new batch), not when positions move. The
+  one exception is a 2D slab, whose vacuum-shrunk cell follows the extent of its atoms
+  along the vacuum axis.
+- Nothing in the tiling carries a gradient, smearings included: it is static data, and
+  the smearing is a convergence parameter rather than a function of the geometry.
+  Gradients flow through the ``batch`` entries, which are the caller's own tensors.
 
 API reference
 =============

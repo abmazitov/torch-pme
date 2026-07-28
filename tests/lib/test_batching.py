@@ -378,10 +378,13 @@ def test_batch_smearing_factor_scales_the_smearing():
     assert scaled["k_int"].shape == default["k_int"].shape
 
 
-def test_batch_smearing_override_skips_nonperiodic_systems():
+@pytest.mark.parametrize(
+    "override", [torch.tensor(0.7, dtype=DTYPE), torch.tensor([0.7, 0.7], dtype=DTYPE)]
+)
+def test_batch_smearing_override_skips_nonperiodic_systems(override):
     samples = [crystal(box=4.0), cluster()]
     _, default = collate(samples)
-    _, tiling = collate(samples, smearing=0.7)
+    _, tiling = collate(samples, smearing=override)
     assert float(tiling["sigma"][0]) == 0.7
     assert float(tiling["sigma"][1]) == float(default["sigma"][1])
 
@@ -400,6 +403,51 @@ def test_batch_stays_on_the_input_device(device):
 def test_batch_warns_when_the_k_padding_window_is_exceeded():
     with pytest.warns(UserWarning, match="above the padding window"):
         collate([crystal(box=4.0)], k_pad_fraction=0.0, num_k=10)
+
+
+def test_batch_tiling_carries_no_gradient():
+    """The tiling is static data: it must not tie the graph to cells or positions."""
+    samples = [crystal(box=4.0), slab(), cluster()]
+    for sample in samples:
+        sample["cell"] = sample["cell"].clone().requires_grad_(True)
+        sample["positions"] = sample["positions"].clone().requires_grad_(True)
+
+    batch, tiling = collate(samples)
+    for name, value in tiling.items():
+        assert not value.requires_grad, f"{name} carries a gradient"
+    # while the batch is made of the caller's own tensors
+    assert batch["cell"].requires_grad
+    assert batch["positions"].requires_grad
+
+
+# --- TorchScript --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "function", [shrink_2d_cell, ewald_params_from_num_k, prepare_tiled_batch]
+)
+def test_functions_are_scriptable(function):
+    assert torch.jit.script(function) is not None
+
+
+def test_scripted_collation_matches_eager():
+    samples = [crystal(box=4.0), cluster(), slab(), crystal(box=6.0, seed=11)]
+    kwargs = {
+        "positions": [s["positions"] for s in samples],
+        "charges": [s["charges"] for s in samples],
+        "cells": [s["cell"] for s in samples],
+        "periodic": [s["periodic"] for s in samples],
+        "neighbor_indices": [s["neighbor_indices"] for s in samples],
+        "neighbor_distances": [s["neighbor_distances"] for s in samples],
+        "num_k": NUM_K,
+    }
+    eager_batch, eager_tiling = prepare_tiled_batch(**kwargs)
+    scripted_batch, scripted_tiling = torch.jit.script(prepare_tiled_batch)(**kwargs)
+
+    for key, value in eager_batch.items():
+        assert torch.equal(value, scripted_batch[key]), f"batch entry {key} differs"
+    for key, value in eager_tiling.items():
+        assert torch.equal(value, scripted_tiling[key]), f"tiling entry {key} differs"
 
 
 # --- error paths --------------------------------------------------------------------

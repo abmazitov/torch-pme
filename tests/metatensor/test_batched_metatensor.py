@@ -255,6 +255,22 @@ def test_batched_torchscript(calculator):
     )
 
 
+def test_batched_prepare_torchscript():
+    systems, blocks = zip(*[sample_3d("CsCl"), sample_3d("NaCl_cubic")], strict=False)
+    systems, blocks = list(systems), list(blocks)
+
+    eager = torchpme.metatensor.prepare_tiled_batch(
+        systems, blocks, num_k=NUM_K, k_pad_fraction=1.0
+    )
+    scripted = torch.jit.script(torchpme.metatensor.prepare_tiled_batch)(
+        systems, blocks, num_k=NUM_K, k_pad_fraction=1.0
+    )
+
+    assert set(scripted) == set(eager)
+    for key, value in eager.items():
+        assert torch.equal(value, scripted[key]), f"tiling entry {key} differs"
+
+
 def test_batched_rejects_mesh_calculators():
     calculator = torchpme.metatensor.PMECalculator(
         torchpme.CoulombPotential(smearing=1.0), mesh_spacing=0.5

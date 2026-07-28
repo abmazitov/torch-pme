@@ -22,6 +22,15 @@ documentation for the evaluation itself):
 All functions here run on the host once per batch (or once per dataset for
 :func:`ewald_params_from_num_k`); nothing needs to be differentiable. The collated
 tensors are returned on the device of the inputs.
+
+The tiling *shapes* — the per-axis k-grid extents, the padded k-count ``K_pad``, the
+length of the flat atom layout and of the dispatch table — are Python integers, so
+:func:`prepare_tiled_batch` has to read a few values back from the device. It copies
+the per-system metadata in one go, so a batch of 3D-periodic and non-periodic systems
+synchronizes exactly once however many systems it holds; 2D slabs cost a little more,
+since shrinking their cell reads a few scalars back per slab. Collating on CPU tensors
+— in a dataloader worker, say — and moving the batch to the device afterwards avoids
+the transfers altogether.
 """
 
 import warnings
@@ -95,7 +104,8 @@ def shrink_2d_cell(
     thickness = z.max() - z.min()
 
     lengths = torch.linalg.norm(cell, dim=-1)
-    l_max = max(lengths[i] for i in range(3) if i != axis)  # longest periodic vector
+    # longest periodic vector (a generator expression here would not be scriptable)
+    l_max = torch.cat([lengths[:axis], lengths[axis + 1 :]]).max()
     h_min = thickness + 1.5 * l_max
 
     if height > 0 and height <= h_min:
@@ -144,7 +154,11 @@ def ewald_params_from_num_k(
         The value used here defines the cutoff your neighbor lists are built at, while
         the one given to :func:`prepare_tiled_batch` defines the smearing the
         evaluation splits at; if the two disagree, the real- and reciprocal-space parts
-        no longer match and the result is silently inaccurate.
+        no longer match and the result is silently inaccurate. This shared factor is
+        deliberately the only thing tying the two calls together:
+        :func:`prepare_tiled_batch` derives :math:`\lambda` and :math:`\sigma` again
+        from its own (2D-shrunk) cells, on host data it has to read anyway, so handing
+        the values computed here back to it would save nothing.
 
     For 2D-periodic systems pass the *effective* (vacuum-shrunk) cell, see
     :func:`shrink_2d_cell`. Non-periodic systems (``periodic`` all ``False``) have no
@@ -243,7 +257,7 @@ def prepare_tiled_batch(
     halfspace: bool = True,
     k_pad_fraction: float = 0.1,
     smearing_factor: float = 2.0,
-    smearing: float | torch.Tensor | None = None,
+    smearing: torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     r"""
     Collate a list of systems into a concatenated batch plus the static tiling data
@@ -260,7 +274,16 @@ def prepare_tiled_batch(
 
     All systems must share the dtype and the device of their tensors; the returned
     tensors live on that same device, ready to be passed to the calculator. The index
-    arithmetic itself runs on the host.
+    arithmetic itself runs on the host: since it decides the shapes of the tiling, it
+    needs the cells and periodicities as host integers, and copies them from the device
+    once per batch rather than once per system. Only 2D slabs add to that, through the
+    scalars :func:`shrink_2d_cell` reads back. Collating on CPU tensors and moving the
+    batch to the device afterwards avoids the transfers entirely.
+
+    Nothing in the returned ``tiling`` carries a gradient: it is static data derived
+    from the cells, and the smearing it holds is a convergence parameter rather than a
+    function of the geometry. The ``batch`` entries are the caller's own tensors, so
+    gradients flow through them as usual.
 
     :param positions: per-system tensors of shape ``(n_atoms_b, 3)``
     :param charges: per-system tensors of shape ``(n_atoms_b, n_channels)``
@@ -279,9 +302,10 @@ def prepare_tiled_batch(
     :param smearing_factor: ratio of the smearing to the reciprocal resolution, see
         :func:`ewald_params_from_num_k`; must match the value used to compute the
         neighbor-list cutoffs
-    :param smearing: optional override of the derived per-system smearing (a scalar or
-        a tensor of shape ``(n_systems,)``), which ignores ``smearing_factor``; the
-        k-grids are still sized by ``num_k``
+    :param smearing: optional override of the derived per-system smearing (a 0-dim
+        tensor or one of shape ``(n_systems,)``), which ignores ``smearing_factor``;
+        the k-grids are still sized by ``num_k``. It is consumed on the host, so pass
+        it on the CPU to avoid one more device-to-host copy.
     :return: tuple ``(batch, tiling)`` of two dictionaries of tensors. ``batch`` holds
         the concatenated inputs of ``forward_batched`` (``positions``, ``charges``,
         ``cell``, ``periodic``, ``system_index``, ``neighbor_indices``,
@@ -387,28 +411,59 @@ def prepare_tiled_batch(
                 f"{b} has {charges[b].shape[1]} instead of {n_channels}"
             )
 
-    n_periodic_axes = [int(p.sum()) for p in periodic]
+    # --- host-side metadata ---
+    # everything that decides a *shape* below (the periodicity of a system, its k-grid
+    # extents, the length of the flat atom layout) has to be a host integer, so the
+    # per-system metadata is copied to the CPU in one go rather than read back value by
+    # value; the collated tensors themselves never leave the device
+    cells_batch = torch.stack(list(cells))
+    periodic_batch = torch.stack(list(periodic))
+    packed = torch.cat(
+        [
+            cells_batch.detach().reshape(n_systems, 9),
+            periodic_batch.to(dtype).reshape(n_systems, 3),
+        ],
+        dim=1,
+    ).cpu()
+    cells_host = packed[:, :9].reshape(n_systems, 3, 3)
+    periodic_host = packed[:, 9:] > 0.5
+
+    n_periodic_axes: list[int] = []
+    for b in range(n_systems):
+        n_periodic_axes.append(int(periodic_host[b].sum()))
     if any(n == 1 for n in n_periodic_axes):
         raise ValueError("1D-periodic systems are not supported")
-    is_periodic = [n > 0 for n in n_periodic_axes]
+    is_periodic: list[bool] = []
+    for n in n_periodic_axes:
+        is_periodic.append(n > 0)
 
     # --- effective (2D-shrunk) cells and per-system Ewald parameters ---
-    effective_cells = torch.stack(
-        [
-            shrink_2d_cell(c, p, pos)
-            for c, p, pos in zip(cells, periodic, positions, strict=True)
-        ]
-    )
-    periodic_batch = torch.stack(periodic)
-    lam, sigma, _ = ewald_params_from_num_k(
-        effective_cells, periodic_batch, num_k, smearing_factor=smearing_factor
+    # only 2D slabs have a cell to shrink, and they are the one place where the
+    # collation looks at the positions; they are shrunk on the device and copied back
+    # in one batch, while a batch without slabs keeps the cells copied above as they are
+    slab_systems: list[int] = []
+    for b in range(n_systems):
+        if n_periodic_axes[b] == 2:
+            slab_systems.append(b)
+
+    effective_cells_host = cells_host.clone()
+    if len(slab_systems) > 0:
+        shrunk: list[torch.Tensor] = []
+        for b in slab_systems:
+            shrunk.append(shrink_2d_cell(cells[b], periodic[b], positions[b]))
+        effective_cells_host[torch.tensor(slab_systems, dtype=torch.long)] = (
+            torch.stack(shrunk).detach().cpu()
+        )
+
+    lam_host, sigma_host, _ = ewald_params_from_num_k(
+        effective_cells_host, periodic_host, num_k, smearing_factor=smearing_factor
     )
     if smearing is not None:
-        override = torch.as_tensor(smearing, dtype=dtype, device=device)
-        sigma = torch.where(
-            periodic_batch.any(dim=-1), override.expand(n_systems), sigma
+        override = smearing.to(sigma_host)
+        sigma_host = torch.where(
+            periodic_host.any(dim=-1), override.expand(n_systems), sigma_host
         )
-    sigma = sigma.to(dtype)
+    sigma = sigma_host.to(device=device, dtype=dtype)
 
     # --- concatenated atom layout ---
     n_atoms = [pos.shape[0] for pos in positions]
@@ -441,12 +496,13 @@ def prepare_tiled_batch(
     n_screened_pairs = sigma_pair.shape[0]
 
     # --- per-system integer k-grids, padded to a common K_pad ---
-    pbc_system = [b for b in range(n_systems) if is_periodic[b]]
-    # the per-axis extents are host integers; read the lengths from CPU copies so that
-    # sizing the grids does not synchronize once per axis and system
-    lengths_host = torch.linalg.norm(effective_cells, dim=-1).cpu()
-    lam_host = lam.cpu()
-    k_grids = []
+    pbc_system: list[int] = []
+    for b in range(n_systems):
+        if is_periodic[b]:
+            pbc_system.append(b)
+    pbc_index = torch.tensor(pbc_system, dtype=torch.long)
+    lengths_host = torch.linalg.norm(effective_cells_host, dim=-1)
+    k_grids: list[torch.Tensor] = []
     for b in pbc_system:
         ns = [
             max(1, int(torch.ceil(lengths_host[b, i] / lam_host[b]))) for i in range(3)
@@ -510,7 +566,7 @@ def prepare_tiled_batch(
     batch = {
         "positions": torch.cat(list(positions)),
         "charges": torch.cat(list(charges)),
-        "cell": torch.stack(list(cells)),
+        "cell": cells_batch,
         "periodic": periodic_batch,
         "system_index": system_index.to(device),
         "neighbor_indices": all_indices,
@@ -520,13 +576,9 @@ def prepare_tiled_batch(
         "k_int": k_int,
         "sigma": sigma,
         "sigma_pair": sigma_pair,
-        "pbc_system": torch.tensor(pbc_system, dtype=torch.long),
-        "periodic_rows": periodic_batch[pbc_system]
-        if n_pbc > 0
-        else torch.zeros(0, 3, dtype=torch.bool),
-        "effective_cell_static": effective_cells[pbc_system]
-        if n_pbc > 0
-        else torch.zeros(0, 3, 3, dtype=dtype),
+        "pbc_system": pbc_index,
+        "periodic_rows": periodic_host[pbc_index],
+        "effective_cell_static": effective_cells_host[pbc_index],
         "b_col": b_col,
         "kt_col": kt_col,
         "atom_gather": atom_gather,

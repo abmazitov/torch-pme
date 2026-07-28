@@ -126,7 +126,7 @@ def prepare_tiled_batch(
     halfspace: bool = True,
     k_pad_fraction: float = 0.1,
     smearing_factor: float = 2.0,
-    smearing: float | torch.Tensor | None = None,
+    smearing: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     Build the static tiling data for :meth:`Calculator.forward_batched` from a list of
@@ -134,9 +134,9 @@ def prepare_tiled_batch(
 
     This is the ``metatensor`` front-end of :func:`torchpme.lib.prepare_tiled_batch`;
     see there for the meaning of the parameters. It runs on the host, once per batch
-    (the tiling depends only on the cells, periodicities, atom counts and pair counts
-    — not on positions), and is not TorchScript-compatible; script only the
-    calculator, and pass the returned tiling to its ``forward_batched``.
+    (the tiling depends only on the cells, periodicities, atom counts and pair counts —
+    and, for 2D slabs, on the extent of the atoms along the vacuum axis). Like the
+    calculator's ``forward_batched``, it is TorchScript-compatible.
 
     Each *periodic* system's neighbor list must have been built at that system's own
     cutoff derived from ``num_k`` (see :func:`torchpme.lib.ewald_params_from_num_k`);
@@ -155,7 +155,8 @@ def prepare_tiled_batch(
     :param k_pad_fraction: padding window of the common k-count
     :param smearing_factor: ratio of the smearing to the reciprocal resolution; must
         match the value used to compute the neighbor-list cutoffs
-    :param smearing: optional override of the derived per-system smearing
+    :param smearing: optional override of the derived per-system smearing, as a 0-dim
+        tensor or one of shape ``(n_systems,)``
     :return: the tiling dictionary consumed by :meth:`Calculator.forward_batched`, on
         the device of the systems
     """
