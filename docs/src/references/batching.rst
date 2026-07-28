@@ -36,9 +36,21 @@ smearing and the real-space cutoff follow:
 
     \lambda_b = \left(\frac{L_1 L_2 L_3}{2\,\mathrm{num\_k}}\right)^{1/3},
     \qquad
-    \sigma_b = 2\lambda_b,
+    \sigma_b = c_\sigma \lambda_b,
     \qquad
-    r_c(b) = 4\sigma_b = 8\lambda_b
+    r_c(b) = c_r \sigma_b
+
+The two factors default to :math:`c_\sigma = 2` and :math:`c_r = 5`, conservative rules
+of thumb that can be adjusted through the ``smearing_factor`` and ``cutoff_factor``
+arguments: :math:`c_\sigma` controls how well the k-grid resolves the smeared charges
+(the reciprocal-space error), :math:`c_r` the real-space truncation error
+:math:`\propto \mathrm{erfc}(c_r/\sqrt{2})`. The default :math:`c_r = 5` is the same
+ratio :class:`torchpme.EwaldCalculator` recommends for a single system (a smearing of
+one fifth of the neighbor-list cutoff). Since ``smearing_factor`` determines both
+the cutoff your neighbor lists are built at and the smearing the evaluation splits at,
+the same value must be given to :func:`torchpme.lib.ewald_params_from_num_k` and to
+:func:`torchpme.lib.prepare_tiled_batch`. For accuracy-driven parameters of a *single*
+structure, use :func:`torchpme.tuning.tune_ewald` instead.
 
 Every system thus realizes *roughly* :math:`\mathrm{num\_k}` k-vectors — the k-axis
 of the batch has an (almost) fixed size, independent of how large the largest cell is
@@ -117,59 +129,29 @@ A single tiled batch may mix:
 Usage: pure torch
 =================
 
-The evaluation is split into a host-side preparation step, run once per batch, and
-the differentiable ``forward_batched`` call:
+The evaluation is split into three steps:
 
-.. code-block:: python
+#. Build the neighbor list of each system at the cutoff its cell implies for the
+   chosen ``num_k``, with :func:`torchpme.lib.ewald_params_from_num_k`.
+#. Collate the systems with :func:`torchpme.lib.prepare_tiled_batch`, which returns a
+   ``batch`` dictionary holding the concatenated inputs and a ``tiling`` dictionary
+   holding the static index tensors. This step runs on the host, once per batch, and
+   nothing in it is differentiable.
+#. Evaluate the batch with :meth:`forward_batched
+   <torchpme.EwaldCalculator.forward_batched>`, passing the entries of ``batch``
+   together with ``tiling``. The per-system smearing derived from ``num_k`` overrides
+   the ``smearing`` of the calculator's potential.
 
-    import torch
-    import vesin
-
-    import torchpme
-    from torchpme.lib import ewald_params_from_num_k, prepare_tiled_batch
-
-    num_k = 200
-
-    # 1. per-system neighbor lists at the num_k-derived cutoff
-    for system in systems:
-        _, _, cutoff = ewald_params_from_num_k(
-            system["cell"], system["periodic"], num_k
-        )
-        nl = vesin.NeighborList(cutoff=float(cutoff), full_list=False)
-        system["neighbor_indices"], system["neighbor_distances"] = ...
-
-    # 2. collate (host-side, once per batch)
-    batch, tiling = prepare_tiled_batch(
-        positions=[s["positions"] for s in systems],
-        charges=[s["charges"] for s in systems],
-        cells=[s["cell"] for s in systems],
-        periodic=[s["periodic"] for s in systems],
-        neighbor_indices=[s["neighbor_indices"] for s in systems],
-        neighbor_distances=[s["neighbor_distances"] for s in systems],
-        num_k=num_k,
-    )
-
-    # 3. evaluate; the tiling's per-system smearing overrides the potential's
-    calculator = torchpme.EwaldCalculator(
-        torchpme.CoulombPotential(smearing=1.0), lr_wavelength=1.0
-    )
-    potentials = calculator.forward_batched(
-        batch["charges"],
-        batch["cell"],
-        batch["positions"],
-        batch["neighbor_indices"],
-        batch["neighbor_distances"],
-        batch["system_index"],
-        batch["periodic"],
-        tiling,
-    )
-
-The result is the concatenation of the per-atom potentials; split it per system with
+Both dictionaries come back on the device of the inputs. The result is the
+concatenation of the per-atom potentials; split it per system with
 ``batch["system_index"]``. For **forces**, recompute the pair distances inside the
 computational graph (from positions, neighbor indices and cell shifts) and pass those
 instead of ``batch["neighbor_distances"]`` — a precomputed distance array is a
-constant to autograd. For a runnable end-to-end version, see the
-:ref:`batched example <sphx_glr_examples_13-batched-ewald.py>`.
+constant to autograd.
+
+The docstring of :func:`torchpme.lib.prepare_tiled_batch` shows a minimal collate and
+evaluate; for a runnable end-to-end version with real neighbor lists and forces, see
+the :ref:`batched example <sphx_glr_examples_13-batched-ewald.py>`.
 
 Usage: metatensor interface
 ===========================
@@ -180,19 +162,11 @@ The :ref:`metatensor bindings <metatensor>` mirror the same split.
 neighbor-list :class:`TensorBlock <metatensor.torch.TensorBlock>` objects, and
 :meth:`forward_batched <torchpme.metatensor.Calculator.forward_batched>` evaluates
 the batch, returning a :class:`metatensor.torch.TensorMap` whose samples label each
-atom by ``("system", "atom")``:
-
-.. code-block:: python
-
-    import torchpme
-
-    tiling = torchpme.metatensor.prepare_tiled_batch(systems, neighbors, num_k=200)
-
-    calculator = torchpme.metatensor.EwaldCalculator(
-        torchpme.CoulombPotential(smearing=1.0), lr_wavelength=1.0
-    )
-    result = calculator.forward_batched(systems, neighbors, tiling)
-    potentials = result.block().values
+atom by ``("system", "atom")``. Since the systems already carry their cells,
+periodicities and charges, the collation takes only the systems, their neighbor blocks
+and ``num_k``, and there is no separate ``batch`` dictionary to unpack — the second
+half of the :ref:`batched example <sphx_glr_examples_13-batched-ewald.py>` runs the
+same systems through this interface.
 
 Pair distances are recomputed internally from the neighbor blocks' distance
 *vectors*, so forces flow to the positions those vectors were computed from. The

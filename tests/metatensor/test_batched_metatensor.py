@@ -276,6 +276,24 @@ def test_batched_rejects_mismatched_lengths(calculator):
         torchpme.metatensor.prepare_tiled_batch(list(systems), [blocks[0]], num_k=NUM_K)
 
 
+def test_batched_rejects_invalid_neighbor_metadata(calculator):
+    # collation only checks what it consumes (the charges); the metadata of the
+    # neighbor blocks is validated by `forward_batched`, which is what reads them
+    systems, blocks = zip(*[sample_3d("CsCl")], strict=False)
+    systems, blocks = list(systems), list(blocks)
+    tiling = torchpme.metatensor.prepare_tiled_batch(
+        systems, blocks, num_k=NUM_K, k_pad_fraction=1.0
+    )
+    broken = mts_torch.TensorBlock(
+        values=blocks[0].values,
+        samples=blocks[0].samples,
+        components=blocks[0].components,
+        properties=mts_torch.Labels.range("not_a_distance", 1),
+    )
+    with pytest.raises(ValueError, match="Invalid properties for `neighbors`"):
+        calculator.forward_batched(systems, [broken], tiling)
+
+
 def test_batched_rejects_missing_charges(calculator):
     system, block = sample_3d("CsCl")
     stripped = mta_torch.System(

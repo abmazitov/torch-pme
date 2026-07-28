@@ -6,6 +6,11 @@ A tiled batch must reproduce the per-structure serial evaluation for 3D crystals
 slabs (via the slab correction; exactly when the vacuum-shrink is a no-op, and up to
 the shrink residual otherwise) and non-periodic clusters (bare potential). The result
 must be independent of the tile sizes, differentiable (forces), and TorchScriptable.
+
+Realistic structures come from the two MAD subsets in ``tests/resources`` (solvated
+ions in 3D cells and catalytic surfaces as 2D slabs); the small synthetic samples
+below cover what those frames cannot: a non-periodic cluster, the branch where the
+2D vacuum-shrink is a no-op, and the structural error paths.
 """
 
 import io
@@ -25,10 +30,17 @@ from torchpme import (
 from torchpme.lib import ewald_params_from_num_k, prepare_tiled_batch, shrink_2d_cell
 
 sys.path.append(str(Path(__file__).parents[1]))
-from helpers import define_crystal, neighbor_list
+from helpers import (
+    MAD_CAT_FRAMES,
+    MAD_SOL_FRAMES,
+    define_crystal,
+    mad_sample,
+    neighbor_list,
+)
 
 DTYPE = torch.float64
 NUM_K = 200
+MAD_FRAMES = 4  # how many frames of each MAD subset to run
 
 
 def sample_3d(crystal):
@@ -49,7 +61,12 @@ def sample_3d(crystal):
 
 
 def sample_2d(vacuum):
-    """A small NaCl-like slab; for ``vacuum <= 7.5`` the cell-shrink is a no-op."""
+    """
+    A small NaCl-like slab; for ``vacuum <= 7.5`` the cell-shrink is a no-op.
+
+    Complements the ``mad_cat`` frames, whose vacuum is always shrunk, so the branch
+    where the effective cell equals the true one is covered too.
+    """
     positions = torch.tensor(
         [[0.0, 0.0, 5.0], [2.0, 2.0, 5.0], [2.0, 0.0, 6.5], [0.0, 2.0, 6.5]],
         dtype=DTYPE,
@@ -219,6 +236,45 @@ def test_tiled_2d_shrunk_slab_vs_serial(calculator):
     # agrees with the serial (unshrunk) evaluation up to the shrink residual ~e^{-3pi}
     samples = [sample_2d(vacuum=20.0)]
     assert_matches_serial(calculator, samples, coulomb, rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.parametrize("frame_index", range(MAD_FRAMES))
+def test_tiled_mad_solvated_vs_serial(calculator, frame_index):
+    # solvated ions: 3D-periodic cells of ~140 atoms
+    samples = [mad_sample(MAD_SOL_FRAMES, frame_index, NUM_K, dtype=DTYPE)]
+    assert_matches_serial(calculator, samples, coulomb)
+
+
+@pytest.mark.parametrize("frame_index", range(MAD_FRAMES))
+def test_tiled_mad_surfaces_vs_serial(calculator, frame_index):
+    # catalytic surfaces: 2D slabs with ~100 A of vacuum along a non-orthogonal axis,
+    # so the tiled path evaluates a shrunk effective cell and agrees with the serial
+    # (unshrunk) evaluation only up to the shrink residual ~e^{-3pi}
+    samples = [mad_sample(MAD_CAT_FRAMES, frame_index, NUM_K, dtype=DTYPE)]
+    assert_matches_serial(calculator, samples, coulomb, rtol=1e-3, atol=1e-4)
+
+
+def test_tiled_mad_mixed_batch_vs_serial(calculator):
+    # one batch spanning both subsets: different sizes, cells and periodicities
+    samples = [
+        mad_sample(MAD_SOL_FRAMES, 0, NUM_K, dtype=DTYPE),
+        mad_sample(MAD_CAT_FRAMES, 0, NUM_K, dtype=DTYPE),
+        mad_sample(MAD_SOL_FRAMES, 1, NUM_K, dtype=DTYPE),
+        mad_sample(MAD_CAT_FRAMES, 1, NUM_K, dtype=DTYPE),
+    ]
+    assert_matches_serial(calculator, samples, coulomb, rtol=1e-3, atol=1e-4)
+
+
+def test_tiled_mad_tile_size_invariance(calculator):
+    samples = [
+        mad_sample(MAD_SOL_FRAMES, 0, NUM_K, dtype=DTYPE),
+        mad_sample(MAD_CAT_FRAMES, 0, NUM_K, dtype=DTYPE),
+    ]
+    batch, tiling = collate(samples)
+    reference = tiled_potential(calculator, batch, tiling)
+    _, tiling_other = collate(samples, block_atoms=16, block_kvecs=64)
+    other = tiled_potential(calculator, batch, tiling_other)
+    torch.testing.assert_close(other, reference, rtol=1e-10, atol=1e-12)
 
 
 def test_tiled_inverse_power_law_vs_serial(calculator):

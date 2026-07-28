@@ -53,21 +53,30 @@ def _validate_system_parameters(system: System, neighbors: TensorBlock) -> None:
             "'cell_shift_c'"
         )
 
-    components_labels = Labels(
-        ["xyz"],
-        torch.arange(3, dtype=torch.int32, device=device).unsqueeze(1),
-    )
+    # compare the names and values directly instead of building throwaway `Labels` to
+    # compare against: this runs on every forward call, and constructing plus comparing
+    # the two `Labels` objects costs ~34 us per system against ~10 us for the checks
+    # below (the metadata they accept is the same)
     components = neighbors.components
-    if len(components) != 1 or components[0] != components_labels:
+    if (
+        len(components) != 1
+        or components[0].names != ["xyz"]
+        or not torch.equal(
+            components[0].values.flatten(),
+            torch.arange(3, dtype=torch.int32, device=device),
+        )
+    ):
         raise ValueError(
             "Invalid components for `neighbors`: there should be a single "
             "'xyz'=[0, 1, 2] component"
         )
 
-    properties_labels = Labels(
-        ["distance"], torch.zeros(1, 1, dtype=torch.int32, device=device)
-    )
-    if neighbors.properties != properties_labels:
+    properties = neighbors.properties
+    if (
+        properties.names != ["distance"]
+        or len(properties) != 1
+        or int(properties.values[0, 0]) != 0
+    ):
         raise ValueError(
             "Invalid properties for `neighbors`: there should be a single "
             "'distance'=0 property"
@@ -116,6 +125,7 @@ def prepare_tiled_batch(
     block_kvecs: int = 128,
     halfspace: bool = True,
     k_pad_fraction: float = 0.1,
+    smearing_factor: float = 2.0,
     smearing: float | torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """
@@ -143,15 +153,22 @@ def prepare_tiled_batch(
     :param block_kvecs: k-tile size of the reciprocal-space kernel
     :param halfspace: keep only one of each ±k pair (with degeneracy factor 2)
     :param k_pad_fraction: padding window of the common k-count
+    :param smearing_factor: ratio of the smearing to the reciprocal resolution; must
+        match the value used to compute the neighbor-list cutoffs
     :param smearing: optional override of the derived per-system smearing
-    :return: the tiling dictionary consumed by :meth:`Calculator.forward_batched`
+    :return: the tiling dictionary consumed by :meth:`Calculator.forward_batched`, on
+        the device of the systems
     """
     if len(systems) != len(neighbors):
         raise ValueError(
             f"Got {len(systems)} systems but {len(neighbors)} neighbor blocks"
         )
-    for system, block in zip(systems, neighbors, strict=True):
-        _validate_system_parameters(system, block)
+    # the full metadata validation happens in `forward_batched`, which is what consumes
+    # the neighbor blocks; running it here as well would double its cost per batch. The
+    # collation only needs the charges, so check just those.
+    for system in systems:
+        if "charge" not in system.known_data():
+            raise ValueError("`system` does not contain `charge` data")
 
     _, tiling = _batching.prepare_tiled_batch(
         positions=[system.positions for system in systems],
@@ -168,10 +185,10 @@ def prepare_tiled_batch(
         block_kvecs=block_kvecs,
         halfspace=halfspace,
         k_pad_fraction=k_pad_fraction,
+        smearing_factor=smearing_factor,
         smearing=smearing,
     )
-    device = systems[0].positions.device
-    return {key: value.to(device) for key, value in tiling.items()}
+    return tiling
 
 
 class Calculator(torch.nn.Module):

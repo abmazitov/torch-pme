@@ -9,9 +9,10 @@ documentation for the evaluation itself):
    real- and reciprocal-space work for every system in a batch. It fixes, per system
    :math:`b`, the reciprocal resolution
    :math:`\lambda_b = (\prod_i L_{b,i} / (2\,\mathrm{num\_k}))^{1/3}`, the smearing
-   :math:`\sigma_b = 2\lambda_b` and the real-space cutoff
-   :math:`r_c(b) = 4\sigma_b = 8\lambda_b` (use :func:`ewald_params_from_num_k` to
-   compute the cutoff at which each system's neighbor list must be built).
+   :math:`\sigma_b = c_\sigma \lambda_b` and the real-space cutoff
+   :math:`r_c(b) = c_r \sigma_b` (use :func:`ewald_params_from_num_k` to compute the
+   cutoff at which each system's neighbor list must be built; the factors
+   :math:`c_\sigma` and :math:`c_r` are adjustable and default to 2 and 5).
 2. The reciprocal-space atom :math:`\times` k-vector sum is block-diagonal across
    systems. :func:`prepare_tiled_batch` lays atoms out in a flat sum-padded array,
    pads every system's k-vectors to a common ``K_pad`` and enumerates only the
@@ -19,12 +20,15 @@ documentation for the evaluation itself):
    dense ``[n_systems, max_atoms, max_kvectors]`` rectangle is never materialized.
 
 All functions here run on the host once per batch (or once per dataset for
-:func:`ewald_params_from_num_k`); nothing needs to be differentiable.
+:func:`ewald_params_from_num_k`); nothing needs to be differentiable. The collated
+tensors are returned on the device of the inputs.
 """
 
 import warnings
 
 import torch
+
+from .._utils import _validate_parameters
 
 __all__ = [
     "ewald_params_from_num_k",
@@ -55,6 +59,21 @@ def shrink_2d_cell(
     :param periodic: torch.tensor of shape ``(3,)`` and dtype bool
     :param positions: torch.tensor of shape ``(n_atoms, 3)``
     :return: torch.tensor of shape ``(3, 3)`` with the (possibly) shrunk cell
+
+    Example
+    -------
+    A slab of thickness 1.5 in a cell with 100 units of vacuum keeps its periodic
+    vectors, while the vacuum axis shrinks to ``1.5 + 1.5 * 4 = 7.5``:
+
+    >>> import torch
+    >>> cell = torch.diag(torch.tensor([4.0, 4.0, 100.0]))
+    >>> positions = torch.tensor([[0.0, 0.0, 0.0], [2.0, 2.0, 1.5]])
+    >>> periodic = torch.tensor([True, True, False])
+    >>> shrink_2d_cell(cell, periodic, positions)
+    tensor([[4.0000, 0.0000, 0.0000],
+            [0.0000, 4.0000, 0.0000],
+            [0.0000, 0.0000, 7.5000]])
+
     """
     if int(periodic.sum()) != 2:
         return cell
@@ -88,7 +107,11 @@ def shrink_2d_cell(
 
 
 def ewald_params_from_num_k(
-    cell: torch.Tensor, periodic: torch.Tensor, num_k: int
+    cell: torch.Tensor,
+    periodic: torch.Tensor,
+    num_k: int,
+    smearing_factor: float = 2.0,
+    cutoff_factor: float = 5.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""
     Derive the per-system Ewald parameters from the target k-vector count ``num_k``.
@@ -96,11 +119,32 @@ def ewald_params_from_num_k(
     Inverting the half-space k-count formula
     :math:`\mathrm{num\_k} \approx \tfrac{1}{2}\prod_i \lceil L_i/\lambda\rceil` gives
     the reciprocal resolution :math:`\lambda`, from which the smearing
-    :math:`\sigma = 2\lambda` and the real-space cutoff
-    :math:`r_c = 4\sigma = 8\lambda` follow. ``r_c`` is the radius at which the
-    system's neighbor list should be built before calling
-    :func:`prepare_tiled_batch`; since it grows with the cell size, it can also be
-    evaluated once for the largest cell of a dataset and used for every structure.
+    :math:`\sigma = c_\sigma \lambda` and the real-space cutoff
+    :math:`r_c = c_r \sigma` follow. ``r_c`` is the radius at which the system's
+    neighbor list should be built before calling :func:`prepare_tiled_batch`; since it
+    grows with the cell size, it can also be evaluated once for the largest cell of a
+    dataset and used for every structure.
+
+    The two factors :math:`c_\sigma = \mathrm{smearing\_factor}` and
+    :math:`c_r = \mathrm{cutoff\_factor}` control the two truncation errors of the
+    split, and their defaults (2 and 5) are deliberately conservative rules of thumb:
+    :math:`c_\sigma` sets how well the k-grid of resolution :math:`\lambda` resolves a
+    Gaussian of width :math:`\sigma` (the reciprocal-space error decreases with
+    :math:`c_\sigma`, at the price of a larger cutoff), while :math:`c_r` sets the
+    real-space error :math:`\propto \mathrm{erfc}(c_r/\sqrt{2})` (increasing it makes
+    the neighbor list, and hence the real-space work, more expensive). The default
+    :math:`c_r = 5` matches the rule of thumb documented for
+    :class:`torchpme.EwaldCalculator`, which suggests a smearing of one fifth of the
+    neighbor-list cutoff. To pick parameters from a target accuracy for a *single*
+    structure instead, use :func:`torchpme.tuning.tune_ewald`.
+
+    .. warning::
+
+        Pass the same ``smearing_factor`` here and to :func:`prepare_tiled_batch`.
+        The value used here defines the cutoff your neighbor lists are built at, while
+        the one given to :func:`prepare_tiled_batch` defines the smearing the
+        evaluation splits at; if the two disagree, the real- and reciprocal-space parts
+        no longer match and the result is silently inaccurate.
 
     For 2D-periodic systems pass the *effective* (vacuum-shrunk) cell, see
     :func:`shrink_2d_cell`. Non-periodic systems (``periodic`` all ``False``) have no
@@ -112,17 +156,47 @@ def ewald_params_from_num_k(
     :param periodic: torch.tensor of dtype bool and shape ``(3,)`` or batched
         ``(n_systems, 3)``
     :param num_k: target half-space k-vector count per system
+    :param smearing_factor: ratio :math:`\sigma/\lambda` of the smearing to the
+        reciprocal resolution
+    :param cutoff_factor: ratio :math:`r_c/\sigma` of the real-space cutoff to the
+        smearing
     :return: tuple ``(lambda, sigma, cutoff)``, each of shape ``()`` for a single
         system or ``(n_systems,)`` for a batch
+
+    Example
+    -------
+    >>> import torch
+    >>> cell = 4.0 * torch.eye(3)
+    >>> periodic = torch.tensor([True, True, True])
+    >>> lam, sigma, cutoff = ewald_params_from_num_k(cell, periodic, num_k=200)
+    >>> print(f"{float(lam):.3f} {float(sigma):.3f} {float(cutoff):.3f}")
+    0.543 1.086 5.429
+
+    A larger ``cutoff_factor`` trades real-space work for accuracy, without changing
+    the smearing or the number of k-vectors:
+
+    >>> _, sigma, cutoff = ewald_params_from_num_k(
+    ...     cell, periodic, num_k=200, cutoff_factor=8.0
+    ... )
+    >>> print(f"{float(sigma):.3f} {float(cutoff):.3f}")
+    1.086 8.686
+
     """
+    if num_k < 1:
+        raise ValueError(f"`num_k` must be a positive integer, got {num_k}")
+    if smearing_factor <= 0:
+        raise ValueError(f"`smearing_factor` must be positive, got {smearing_factor}")
+    if cutoff_factor <= 0:
+        raise ValueError(f"`cutoff_factor` must be positive, got {cutoff_factor}")
+
     single = cell.dim() == 2
     cells = cell.unsqueeze(0) if single else cell
     periodics = periodic.unsqueeze(0) if single else periodic
 
     lengths = torch.linalg.norm(cells, dim=-1)
     lam = (lengths.prod(dim=-1) / (2.0 * num_k)) ** (1.0 / 3.0)
-    sigma = 2.0 * lam
-    cutoff = 4.0 * sigma
+    sigma = smearing_factor * lam
+    cutoff = cutoff_factor * sigma
 
     nonperiodic = ~periodics.any(dim=-1)
     lam = torch.where(nonperiodic, torch.zeros_like(lam), lam)
@@ -168,6 +242,7 @@ def prepare_tiled_batch(
     block_kvecs: int = 128,
     halfspace: bool = True,
     k_pad_fraction: float = 0.1,
+    smearing_factor: float = 2.0,
     smearing: float | torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     r"""
@@ -183,8 +258,9 @@ def prepare_tiled_batch(
     radius); non-periodic systems provide the pair list over which the *bare*
     (non-range-separated) potential is summed, typically all pairs.
 
-    All returned tensors live on the CPU; move them to the target device with
-    ``.to(device)`` before calling the calculator.
+    All systems must share the dtype and the device of their tensors; the returned
+    tensors live on that same device, ready to be passed to the calculator. The index
+    arithmetic itself runs on the host.
 
     :param positions: per-system tensors of shape ``(n_atoms_b, 3)``
     :param charges: per-system tensors of shape ``(n_atoms_b, n_channels)``
@@ -200,16 +276,76 @@ def prepare_tiled_batch(
     :param k_pad_fraction: padding window of the common k-count: the k-axis is padded
         to at least ``(1 + k_pad_fraction) * num_k`` vectors so that batches sharing
         the same ``num_k`` get identical shapes
+    :param smearing_factor: ratio of the smearing to the reciprocal resolution, see
+        :func:`ewald_params_from_num_k`; must match the value used to compute the
+        neighbor-list cutoffs
     :param smearing: optional override of the derived per-system smearing (a scalar or
-        a tensor of shape ``(n_systems,)``); the k-grids are still sized by ``num_k``
+        a tensor of shape ``(n_systems,)``), which ignores ``smearing_factor``; the
+        k-grids are still sized by ``num_k``
     :return: tuple ``(batch, tiling)`` of two dictionaries of tensors. ``batch`` holds
         the concatenated inputs of ``forward_batched`` (``positions``, ``charges``,
         ``cell``, ``periodic``, ``system_index``, ``neighbor_indices``,
         ``neighbor_distances``); ``tiling`` holds the static index tensors and
         parameters (its integer metadata is stored as 0-dim tensors so that it stays a
         ``Dict[str, Tensor]`` for TorchScript).
+
+    Example
+    -------
+    Two 3D-periodic systems of different size, collated and evaluated in one call. In
+    practice the per-system pair lists come from a neighbor-list code (such as
+    ``vesin``) run at the cutoff of :func:`ewald_params_from_num_k`; here they are
+    written out explicitly:
+
+    >>> import torch
+    >>> import torchpme
+    >>> positions = [
+    ...     torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]]),
+    ...     torch.tensor([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]),
+    ... ]
+    >>> charges = [torch.tensor([[1.0], [-1.0]])] * 2
+    >>> cells = [torch.eye(3), 2.0 * torch.eye(3)]
+    >>> periodic = [torch.tensor([True, True, True])] * 2
+    >>> neighbor_indices = [torch.tensor([[0, 1]])] * 2
+    >>> neighbor_distances = [torch.tensor([0.8660]), torch.tensor([1.7321])]
+    >>> batch, tiling = prepare_tiled_batch(
+    ...     positions=positions,
+    ...     charges=charges,
+    ...     cells=cells,
+    ...     periodic=periodic,
+    ...     neighbor_indices=neighbor_indices,
+    ...     neighbor_distances=neighbor_distances,
+    ...     num_k=200,
+    ... )
+
+    The smearing is derived per system from ``num_k``, so the larger cell gets the
+    larger smearing:
+
+    >>> print(tiling["sigma"])
+    tensor([0.2714, 0.5429])
+
+    ``forward_batched`` returns the concatenated per-atom potentials; split them per
+    system with ``batch["system_index"]``:
+
+    >>> calculator = torchpme.EwaldCalculator(
+    ...     torchpme.CoulombPotential(smearing=1.0), lr_wavelength=1.0
+    ... )
+    >>> potentials = calculator.forward_batched(
+    ...     batch["charges"],
+    ...     batch["cell"],
+    ...     batch["positions"],
+    ...     batch["neighbor_indices"],
+    ...     batch["neighbor_distances"],
+    ...     batch["system_index"],
+    ...     batch["periodic"],
+    ...     tiling,
+    ... )
+    >>> print(potentials.shape, batch["system_index"])
+    torch.Size([4, 1]) tensor([0, 0, 1, 1])
+
     """
     n_systems = len(positions)
+    if n_systems == 0:
+        raise ValueError("Cannot collate an empty list of systems")
     if not (
         len(charges)
         == len(cells)
@@ -219,20 +355,37 @@ def prepare_tiled_batch(
         == n_systems
     ):
         raise ValueError("All per-system input lists must have the same length")
-    if n_systems == 0:
-        raise ValueError("Cannot collate an empty list of systems")
     if block_atoms < 1 or block_kvecs < 1:
         raise ValueError("`block_atoms` and `block_kvecs` must be positive")
 
-    dtype = positions[0].dtype
-    if charges[0].dim() != 2:
-        raise ValueError(
-            "`charges` must be 2-dimensional tensors [n_atoms, n_channels]"
+    # the shapes, dtypes and devices of a single system are exactly what the
+    # calculators check on every forward call, so reuse the same helper here
+    for b in range(n_systems):
+        _validate_parameters(
+            charges=charges[b],
+            cell=cells[b],
+            positions=positions[b],
+            neighbor_indices=neighbor_indices[b],
+            neighbor_distances=neighbor_distances[b],
+            periodic=periodic[b],
         )
+
+    # what remains are the invariants across systems
+    dtype = positions[0].dtype
+    device = positions[0].device
     n_channels = charges[0].shape[1]
-    for q in charges:
-        if q.dim() != 2 or q.shape[1] != n_channels:
-            raise ValueError("All systems must have the same number of charge channels")
+    for b in range(1, n_systems):
+        if positions[b].dtype != dtype or positions[b].device != device:
+            raise ValueError(
+                "All systems must share the dtype and device of the first system, but "
+                f"system {b} has {positions[b].dtype} on {positions[b].device} instead "
+                f"of {dtype} on {device}"
+            )
+        if charges[b].shape[1] != n_channels:
+            raise ValueError(
+                "All systems must have the same number of charge channels, but system "
+                f"{b} has {charges[b].shape[1]} instead of {n_channels}"
+            )
 
     n_periodic_axes = [int(p.sum()) for p in periodic]
     if any(n == 1 for n in n_periodic_axes):
@@ -247,9 +400,11 @@ def prepare_tiled_batch(
         ]
     )
     periodic_batch = torch.stack(periodic)
-    lam, sigma, _ = ewald_params_from_num_k(effective_cells, periodic_batch, num_k)
+    lam, sigma, _ = ewald_params_from_num_k(
+        effective_cells, periodic_batch, num_k, smearing_factor=smearing_factor
+    )
     if smearing is not None:
-        override = torch.as_tensor(smearing, dtype=dtype)
+        override = torch.as_tensor(smearing, dtype=dtype, device=device)
         sigma = torch.where(
             periodic_batch.any(dim=-1), override.expand(n_systems), sigma
         )
@@ -260,6 +415,8 @@ def prepare_tiled_batch(
     atom_offsets = [0]
     for n in n_atoms:
         atom_offsets.append(atom_offsets[-1] + n)
+    # the index arithmetic below stays on the host; only the collated tensors are
+    # created on (or moved to) the device of the inputs
     system_index = torch.repeat_interleave(
         torch.arange(n_systems), torch.tensor(n_atoms)
     )
@@ -276,8 +433,8 @@ def prepare_tiled_batch(
         else:
             bare_indices.append(offset_pairs)
             bare_distances.append(neighbor_distances[b])
-    empty_indices = torch.empty(0, 2, dtype=torch.long)
-    empty_distances = torch.empty(0, dtype=dtype)
+    empty_indices = torch.empty(0, 2, dtype=torch.long, device=device)
+    empty_distances = torch.empty(0, dtype=dtype, device=device)
     all_indices = torch.cat(screened_indices + bare_indices + [empty_indices])
     all_distances = torch.cat(screened_distances + bare_distances + [empty_distances])
     sigma_pair = torch.cat(screened_sigma + [empty_distances])
@@ -285,10 +442,15 @@ def prepare_tiled_batch(
 
     # --- per-system integer k-grids, padded to a common K_pad ---
     pbc_system = [b for b in range(n_systems) if is_periodic[b]]
+    # the per-axis extents are host integers; read the lengths from CPU copies so that
+    # sizing the grids does not synchronize once per axis and system
+    lengths_host = torch.linalg.norm(effective_cells, dim=-1).cpu()
+    lam_host = lam.cpu()
     k_grids = []
     for b in pbc_system:
-        lengths = torch.linalg.norm(effective_cells[b], dim=-1)
-        ns = [max(1, int(torch.ceil(lengths[i] / lam[b]))) for i in range(3)]
+        ns = [
+            max(1, int(torch.ceil(lengths_host[b, i] / lam_host[b]))) for i in range(3)
+        ]
         k_grids.append(_integer_kgrid(ns, halfspace))
 
     # pad the k-axis to at least (1 + k_pad_fraction)·num_k so that batches sharing
@@ -348,9 +510,9 @@ def prepare_tiled_batch(
     batch = {
         "positions": torch.cat(list(positions)),
         "charges": torch.cat(list(charges)),
-        "cell": torch.stack(list(cells)).to(dtype),
+        "cell": torch.stack(list(cells)),
         "periodic": periodic_batch,
-        "system_index": system_index,
+        "system_index": system_index.to(device),
         "neighbor_indices": all_indices,
         "neighbor_distances": all_distances,
     }
@@ -362,7 +524,7 @@ def prepare_tiled_batch(
         "periodic_rows": periodic_batch[pbc_system]
         if n_pbc > 0
         else torch.zeros(0, 3, dtype=torch.bool),
-        "effective_cell_static": effective_cells[pbc_system].to(dtype)
+        "effective_cell_static": effective_cells[pbc_system]
         if n_pbc > 0
         else torch.zeros(0, 3, 3, dtype=dtype),
         "b_col": b_col,
@@ -378,4 +540,4 @@ def prepare_tiled_batch(
         "n_screened_pairs": torch.tensor(n_screened_pairs, dtype=torch.long),
         "g_factor": torch.tensor(2.0 if halfspace else 1.0, dtype=dtype),
     }
-    return batch, tiling
+    return batch, {key: value.to(device) for key, value in tiling.items()}

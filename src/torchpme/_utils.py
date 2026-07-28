@@ -221,6 +221,9 @@ def _validate_parameters(
                 f"the `positions` class ({device})"
             )
 
+        if periodic.dtype != torch.bool:
+            raise TypeError(f"type of `periodic` ({periodic.dtype}) must be torch.bool")
+
     if pair_mask is not None:
         if pair_mask.shape != neighbor_indices[:, 0].shape:
             raise ValueError(

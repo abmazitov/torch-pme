@@ -56,7 +56,9 @@ for n_atoms, box in [(2, 3.0), (3, 4.0), (4, 5.0), (5, 6.0), (6, 7.0)]:
 # for the chosen ``num_k``: bigger cells need a slightly larger cutoff, smaller cells a
 # smaller one. :func:`torchpme.lib.ewald_params_from_num_k` derives, per system, the
 # reciprocal resolution ``lambda``, the Ewald smearing ``sigma = 2 * lambda``, and the
-# neighbor-list cutoff ``r_c = 4 * sigma``. This can be done once for a whole dataset.
+# neighbor-list cutoff ``r_c = 5 * sigma``. Both factors are adjustable through the
+# ``smearing_factor`` and ``cutoff_factor`` arguments, and this can be done once for a
+# whole dataset.
 
 for system in systems:
     _, sigma, cutoff = ewald_params_from_num_k(

@@ -187,8 +187,8 @@ class EwaldCalculator(Calculator):
         :param system_index: torch.tensor of shape ``(n_atoms,)`` mapping each atom to
             its system.
         :param periodic: torch.tensor of shape ``(n_systems, 3)`` and dtype bool.
-        :param tiling: the static tiling data built by ``prepare_tiled_batch`` (moved
-            to the same device as ``positions``).
+        :param tiling: the static tiling data built by ``prepare_tiled_batch``, on the
+            same device as ``positions``.
         :return: torch.tensor of shape ``(n_atoms, n_channels)`` with the per-atom
             potential, in the same units and conventions as :func:`forward`.
         """
